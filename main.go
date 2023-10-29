@@ -3,8 +3,11 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"log"
 	"math/big"
 	"net/http"
@@ -15,7 +18,17 @@ import (
 )
 
 func main() {
+	//open database
+	db, err := sql.Open("sqlite3", "./totally_not_my_privateKeys.db")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
 	genKeys()
+	//store the keys
+	storeKey(goodPrivKey, db)
+	storeKey(expiredPrivKey, db)
 	http.HandleFunc("/.well-known/jwks.json", JWKSHandler)
 	http.HandleFunc("/auth", AuthHandler)
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -26,6 +39,16 @@ var (
 	expiredPrivKey *rsa.PrivateKey
 )
 
+func storeKey(key *rsa.PrivateKey, db *sql.DB) {
+	privDER := x509.MarshalPKCS1PrivateKey(key)
+	privBlock := pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: privDER,
+	}
+	pemStr := string(pem.EncodeToMemory(&privBlock))
+	db.Exec(`INSERT INTO keys (pem_key) VALUES (?)`, pemStr)
+}
+
 func genKeys() {
 	// generate global key pair
 	var err error
@@ -35,6 +58,7 @@ func genKeys() {
 	}
 
 	// Generate an expired key pair for demonstration purposes
+
 	expiredPrivKey, err = rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		log.Fatalf("Error generating expired RSA keys: %v", err)
@@ -61,7 +85,7 @@ func AuthHandler(w http.ResponseWriter, r *http.Request) {
 
 	// If the expired query parameter is set, use the expired key
 	if expired, _ := strconv.ParseBool(r.URL.Query().Get("expired")); expired {
-		signingKey = expiredPrivKey
+		signingKey = expiredPrivKey //change to pull from DB
 		keyID = "expiredKeyId"
 		exp = time.Now().Add(-1 * time.Hour).Unix()
 	}
@@ -82,6 +106,7 @@ func AuthHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(signedToken))
 }
 
+// outline for JWKS key
 type (
 	JWKS struct {
 		Keys []JWK `json:"keys"`
@@ -104,6 +129,8 @@ func JWKSHandler(w http.ResponseWriter, r *http.Request) {
 	base64URLEncode := func(b *big.Int) string {
 		return base64.RawURLEncoding.EncodeToString(b.Bytes())
 	}
+
+	//change to read from DB
 	publicKey := goodPrivKey.Public().(*rsa.PublicKey)
 	resp := JWKS{
 		Keys: []JWK{
