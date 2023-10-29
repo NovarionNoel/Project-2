@@ -15,7 +15,15 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	_ "github.com/mattn/go-sqlite3"
 )
+
+type AuthHandler struct {
+	DB *sql.DB
+}
+type JWKSHandler struct {
+	DB *sql.DB
+}
 
 func main() {
 	//open database
@@ -24,13 +32,15 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
-
+	initializeTable(db)
 	genKeys()
 	//store the keys
-	storeKey(goodPrivKey, db)
-	storeKey(expiredPrivKey, db)
-	http.HandleFunc("/.well-known/jwks.json", JWKSHandler)
-	http.HandleFunc("/auth", AuthHandler)
+	storeKey(db, goodPrivKey, false)
+	storeKey(db, expiredPrivKey, true)
+	authHandler := &AuthHandler{DB: db}
+	jwksHandler := &JWKSHandler{DB: db}
+	http.Handle("/.well-known/jwks.json", jwksHandler)
+	http.Handle("/auth", authHandler)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -39,14 +49,66 @@ var (
 	expiredPrivKey *rsa.PrivateKey
 )
 
-func storeKey(key *rsa.PrivateKey, db *sql.DB) {
+// take rsa private key, convert to PEM, and store it in the database
+func storeKey(db *sql.DB, key *rsa.PrivateKey, expired bool) {
 	privDER := x509.MarshalPKCS1PrivateKey(key)
 	privBlock := pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: privDER,
 	}
 	pemStr := string(pem.EncodeToMemory(&privBlock))
-	db.Exec(`INSERT INTO keys (pem_key) VALUES (?)`, pemStr)
+
+	exp := time.Now().Add(-1 * time.Hour).Unix()
+	if !expired {
+		exp = time.Now().Add(1 * time.Hour).Unix()
+	}
+
+	//put keys in database
+	insertQuery := `INSERT INTO keys (key, exp) VALUES (?, ?)`
+	stmt, err := db.Prepare(insertQuery)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(pemStr, exp)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+}
+
+// fetch key from the database and return the key in *rsa.PrivateKey format.
+func getKey(db *sql.DB, expired bool) *rsa.PrivateKey {
+	var pemKey string
+	var err error
+	currentTime := time.Now().Unix()
+
+	if expired {
+		err = db.QueryRow("SELECT key FROM keys WHERE exp <= ? LIMIT 1", currentTime).Scan(&pemKey)
+	} else {
+		err = db.QueryRow("SELECT key FROM keys WHERE exp > ? LIMIT 1", currentTime).Scan(&pemKey)
+	}
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+
+			log.Println("No matching key found")
+		} else {
+			log.Fatal(err)
+		}
+	}
+	block, _ := pem.Decode([]byte(pemKey))
+	if block == nil {
+
+		return nil
+	}
+
+	privKey, err2 := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err2 != nil {
+		return nil
+	}
+	return privKey
 }
 
 func genKeys() {
@@ -67,7 +129,7 @@ func genKeys() {
 
 const goodKID = "aRandomKeyID"
 
-func AuthHandler(w http.ResponseWriter, r *http.Request) {
+func (h *AuthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -79,13 +141,13 @@ func AuthHandler(w http.ResponseWriter, r *http.Request) {
 	)
 
 	// Default to the good key
-	signingKey = goodPrivKey
+	signingKey = getKey(h.DB, false)
 	keyID = goodKID
 	exp = time.Now().Add(1 * time.Hour).Unix()
 
 	// If the expired query parameter is set, use the expired key
 	if expired, _ := strconv.ParseBool(r.URL.Query().Get("expired")); expired {
-		signingKey = expiredPrivKey //change to pull from DB
+		signingKey = getKey(h.DB, true)
 		keyID = "expiredKeyId"
 		exp = time.Now().Add(-1 * time.Hour).Unix()
 	}
@@ -121,7 +183,7 @@ type (
 	}
 )
 
-func JWKSHandler(w http.ResponseWriter, r *http.Request) {
+func (h *JWKSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -130,8 +192,7 @@ func JWKSHandler(w http.ResponseWriter, r *http.Request) {
 		return base64.RawURLEncoding.EncodeToString(b.Bytes())
 	}
 
-	//change to read from DB
-	publicKey := goodPrivKey.Public().(*rsa.PublicKey)
+	publicKey := getKey(h.DB, false)
 	resp := JWKS{
 		Keys: []JWK{
 			{
@@ -147,4 +208,41 @@ func JWKSHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// check what needs to be done with the table
+func initializeTable(db *sql.DB) {
+	var name string
+
+	err := db.QueryRow("SELECT name FROM sqlite_master WHERE type='table' AND name='keys'").Scan(&name)
+
+	switch {
+	case err == sql.ErrNoRows:
+
+		createTable(db)
+	case err != nil:
+		log.Fatalf("Failed to check for table existence: %v", err)
+	default:
+		// Table exists. Drop and recreate.
+		_, err = db.Exec("DROP TABLE keys")
+		if err != nil {
+			log.Fatalf("Failed to drop table: %v", err)
+		}
+		createTable(db)
+	}
+
+}
+
+// create the table in the datbase
+func createTable(db *sql.DB) {
+	_, err := db.Exec(`CREATE TABLE keys (
+		kid INTEGER PRIMARY KEY AUTOINCREMENT,
+		key BLOB NOT NULL,
+		exp INTEGER NOT NULL
+	);
+`)
+	if err != nil {
+		log.Fatalf("Failed to create table: %v", err)
+	}
+	log.Printf("Created table")
 }
