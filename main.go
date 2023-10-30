@@ -25,6 +25,11 @@ type JWKSHandler struct {
 	DB *sql.DB
 }
 
+var (
+	goodPrivKey    *rsa.PrivateKey
+	expiredPrivKey *rsa.PrivateKey
+)
+
 func main() {
 	//open database
 	db, err := sql.Open("sqlite3", "./totally_not_my_privateKeys.db")
@@ -37,17 +42,13 @@ func main() {
 	//store the keys
 	storeKey(db, goodPrivKey, false)
 	storeKey(db, expiredPrivKey, true)
+	//handler structures so I can pass parameters
 	authHandler := &AuthHandler{DB: db}
 	jwksHandler := &JWKSHandler{DB: db}
 	http.Handle("/.well-known/jwks.json", jwksHandler)
 	http.Handle("/auth", authHandler)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
-
-var (
-	goodPrivKey    *rsa.PrivateKey
-	expiredPrivKey *rsa.PrivateKey
-)
 
 // take rsa private key, convert to PEM, and store it in the database
 func storeKey(db *sql.DB, key *rsa.PrivateKey, expired bool) {
@@ -244,5 +245,4 @@ func createTable(db *sql.DB) {
 	if err != nil {
 		log.Fatalf("Failed to create table: %v", err)
 	}
-	log.Printf("Created table")
 }
